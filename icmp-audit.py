@@ -273,7 +273,9 @@ def icmp_audit_ts(args, asset):
     proc = Stats([p["processing_ms"] for p in packets])
     loss_pct = 100 * (1 - (received / args.count)) 
     drift_ms_per_sec = linear_slope(packets)
-
+    local_time = ms_since_midnight_utc()
+    remote_time = int((local_time +offset.avg) % 86_400_000)
+    
     match offset.avg:
         case x if abs(x) < 50:
             offset_desc = "near-synchronised clock"
@@ -317,6 +319,9 @@ def icmp_audit_ts(args, asset):
     print(f"Packets sent:                  {args.count}")
     print(f"Replies received:              {received}")
     print(f"Packet loss:                   {loss_pct:.1f}%")
+    print()
+    print(f"Local Time (HH:MM:SS):         {decode_ms(local_time)} UTC")
+    print(f"Remote Time (HH:MM:SS):        {decode_ms(remote_time)} UTC")
     print()
     print(f"RTT avg:                       {rtt.avg:.3f} ms")
     print(f"RTT min/max:                   {rtt.min:.3f} / {rtt.max:.3f} ms")
