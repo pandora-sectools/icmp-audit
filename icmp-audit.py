@@ -15,8 +15,6 @@ from typing import Optional
 # Data Handling
 # ---------------------------------------
 
-ICMP_TIMESTAMP_REQUEST = 13
-ICMP_TIMESTAMP_REPLY = 14
 PROC_IDENT = os.getpid() & 0xffff
 
 IPV4_RE = re.compile(
@@ -57,50 +55,6 @@ class Stats:
         self.stdev = (
             statistics.stdev(self.values)
             if len(self.values) > 1 else 0.0)
-
-@dataclass
-class ICMPRequest:
-    packet_format: str = "!BBHHHIII"
-    icmp_type: int = 0
-    code: int = 0
-    checksum: int = 0
-    ident: int = PROC_IDENT
-    sequence: int = 0
-    originate_ts: int = 0
-    receive_ts: int = 0
-    transmit_ts: int = 0
-
-    def pack(self) -> bytes:
-        packet = struct.pack(
-            self.packet_format,
-            self.icmp_type,
-            self.code,
-            self.checksum,
-            self.ident,
-            self.sequence,
-            self.originate_ts,
-            self.receive_ts,
-            self.transmit_ts)
-
-        return (
-            packet[:2]
-            + struct.pack("!H", mk_checksum(packet))
-            + packet[4:])
-
-@dataclass
-class ICMPReply:
-    icmp_type: int
-    code: int
-    checksum: int
-    ident: int
-    sequence: int
-    originate_ms: int
-    receive_ms: int
-    transmit_ms: int
-
-    @classmethod
-    def unpack(cls, packet: bytes):
-        return cls(*struct.unpack("!BBHHHIII", packet[:20]))
 
 
 # Helper Functions
@@ -152,6 +106,9 @@ def ms_since_midnight_utc() -> int:
 def decode_ms(ms: int) -> str:
     return str(timedelta(milliseconds=ms % 86_400_000))
 
+def decode_netmask(mask: int) -> str:
+    return socket.inet_ntoa(struct.pack("!I", mask))
+
 def parse_ipv4_icmp(raw_packet: bytes) -> bytes:
     ip_header_len = (raw_packet[0] & 0x0F) * 4
     return raw_packet[ip_header_len:]
@@ -169,6 +126,94 @@ def linear_slope(packets: list):
     return statistics.linear_regression(xs, ys).slope
 
 
+# ICMP Packet Structures
+# ---------------------------------------
+
+ICMP_TIMESTAMP_REQUEST = 13
+ICMP_TIMESTAMP_REPLY = 14
+ICMP_MASK_REQUEST = 17
+ICMP_MASK_REPLY = 18
+
+@dataclass
+class ICMPRequest:
+    sequence: int 
+    ident: int = PROC_IDENT
+    icmp_type: int = 0
+    code: int = 0
+    checksum: int = 0    
+
+    def payload(self) -> bytes:
+        return b""
+
+    def pack(self) -> bytes:
+        packet = struct.pack(
+            "!BBHHH",
+            self.icmp_type,
+            self.code,
+            self.checksum,
+            self.ident,
+            self.sequence
+        ) + self.payload()
+
+        return (
+            packet[:2]
+            + struct.pack("!H", mk_checksum(packet))
+            + packet[4:])
+
+@dataclass
+class ICMPReply:
+    icmp_type: int
+    code: int
+    checksum: int
+    ident: int
+    sequence: int
+
+    def matches(self, icmp_type: int, sequence: int) -> bool:
+        return (
+            self.icmp_type == icmp_type
+            and self.ident == PROC_IDENT
+            and self.sequence == sequence)
+
+@dataclass
+class ICMPTimestampRequest(ICMPRequest):
+    originate_ts: int = 0
+    receive_ts: int = 0
+    transmit_ts: int = 0
+    
+    def payload(self) -> bytes:
+        return struct.pack(
+            "!III",
+            self.originate_ts,
+            self.receive_ts,
+            self.transmit_ts)
+
+@dataclass
+class ICMPMaskRequest(ICMPRequest):
+    subnet_mask: int = 0
+
+    def payload(self) -> bytes:
+        return struct.pack("!I", self.subnet_mask)
+
+@dataclass
+class ICMPTimestampReply(ICMPReply):
+    originate_ms: int
+    receive_ms: int
+    transmit_ms: int
+
+    @classmethod
+    def unpack(cls, packet: bytes):
+        return cls(*struct.unpack("!BBHHHIII", packet[:20]))
+
+
+@dataclass
+class ICMPMaskReply(ICMPReply):
+    subnet_mask: int
+
+    @classmethod
+    def unpack(cls, packet: bytes):
+        return cls(*struct.unpack("!BBHHHI", packet[:12]))
+
+
 # ICMP packet handler
 # ---------------------------------------
 
@@ -177,7 +222,7 @@ def send_icmp_ts(sock: socket.socket, asset: Asset, sequence: int, timeout: floa
     originate_ms = ms_since_midnight_utc()
     send_mono = time.monotonic()
     
-    packet = ICMPRequest(   
+    packet = ICMPTimestampRequest(   
         sequence=sequence,
         icmp_type=ICMP_TIMESTAMP_REQUEST,
         originate_ts=originate_ms).pack()
@@ -189,10 +234,9 @@ def send_icmp_ts(sock: socket.socket, asset: Asset, sequence: int, timeout: floa
             raw_packet, source = sock.recvfrom(1024)
             local_recv_ts = time.monotonic()
             local_recv_wall_ms = ms_since_midnight_utc()
-            reply = ICMPReply.unpack(parse_ipv4_icmp(raw_packet))
+            reply = ICMPTimestampReply.unpack(parse_ipv4_icmp(raw_packet))
 
-            if (reply.icmp_type, reply.ident, reply.sequence) != (
-                ICMP_TIMESTAMP_REPLY,PROC_IDENT,sequence):
+            if not reply.matches(ICMP_TIMESTAMP_REPLY, sequence):
                 continue
 
             offset_ms = (
@@ -211,6 +255,39 @@ def send_icmp_ts(sock: socket.socket, asset: Asset, sequence: int, timeout: floa
                 "offset_ms": offset_ms,
                 "local_recv_ts": local_recv_ts}
 
+    except socket.timeout:
+        return False
+
+
+def send_icmp_mask(sock: socket.socket, asset: Asset, sequence: int, timeout: float):
+
+    send_mono = time.monotonic()
+
+    packet = ICMPMaskRequest(
+        sequence=sequence,
+        icmp_type=ICMP_MASK_REQUEST
+    ).pack()
+
+    sock.settimeout(timeout)
+    sock.sendto(packet, (asset.ipv4, 0))
+
+    try:
+        while True:
+
+            raw_packet, source = sock.recvfrom(1024)
+            recv_mono = time.monotonic()
+
+            reply = ICMPMaskReply.unpack(parse_ipv4_icmp(raw_packet))
+
+            if not reply.matches(ICMP_MASK_REPLY, sequence):
+                continue
+
+            return {
+                "sequence": sequence,
+                "source": source[0],
+                "mask": decode_netmask(reply.subnet_mask),
+                "rtt_ms": (recv_mono - send_mono) * 1000
+            }
     except socket.timeout:
         return False
 
@@ -274,7 +351,7 @@ def icmp_audit_ts(args, asset):
     loss_pct = 100 * (1 - (received / args.count)) 
     drift_ms_per_sec = linear_slope(packets)
     local_time = ms_since_midnight_utc()
-    remote_time = int((local_time +offset.avg) % 86_400_000)
+    remote_time = int((local_time + offset.avg) % 86_400_000)
     
     match offset.avg:
         case x if abs(x) < 50:
@@ -334,6 +411,39 @@ def icmp_audit_ts(args, asset):
     print(f"Remote processing avg:         {proc.avg:.3f} ms")
     print(f"Estimated clock drift:         {drift_ms_per_sec:.6f} ms/sec")    
 
+def icmp_audit_mask(args, asset):
+
+    if not asset.ipv4:
+        print("ICMP Address Mask requires an IPv4 address.")
+        return
+
+    print("\n---------------------------------------")
+    print("ICMP Address Mask Disclosure (Mode 17/18)")
+
+    with socket.socket(
+        socket.AF_INET,
+        socket.SOCK_RAW,
+        socket.IPPROTO_ICMP
+    ) as sock:
+
+        result = send_icmp_mask(
+            timeout=args.timeout,
+            sequence=1,
+            asset=asset,
+            sock=sock
+        )
+
+    print("\n---------------------------------------")
+
+    if not result:
+        print("No ICMP address mask reply received.")
+        return
+
+    print("[+] Address Mask Summary")
+    print(f"Source:                        {result['source']}")
+    print(f"Subnet mask:                   {result['mask']}")
+    print(f"RTT:                           {result['rtt_ms']:.3f} ms")
+
 ICMP_AUDIT_EXEC = {
     "all": {
         "description": "Run all ICMP Checks",
@@ -345,7 +455,11 @@ ICMP_AUDIT_EXEC = {
     },
     "timestamp": {
         "description": "ICMP Timestamp Request/Reply",
-        "runner": icmp_audit_ts}}
+        "runner": icmp_audit_ts
+    },
+    "mask": {
+        "description": "ICMP Mask Request/Reply",
+        "runner": icmp_audit_mask}}
 
 
 # main
